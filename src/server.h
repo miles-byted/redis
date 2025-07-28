@@ -65,6 +65,7 @@ typedef long long ustime_t; /* microsecond time type. */
                            N-elements flat arrays */
 #include "rax.h"     /* Radix tree */
 #include "connection.h" /* Connection abstraction */
+#include "trie.h"    /* Trie data structure */
 
 #define REDISMODULE_CORE 1
 typedef struct redisObject robj;
@@ -1988,6 +1989,7 @@ struct redisServer {
     /* Pubsub */
     kvstore *pubsub_channels;  /* Map channels to list of subscribed clients */
     dict *pubsub_patterns;  /* A dict of pubsub_patterns */
+    trie *pubsub_patterns_trie; /* A trie of pubsub_patterns */
     int notify_keyspace_events; /* Events to propagate via Pub/Sub. This is an
                                    xor of NOTIFY_... flags. */
     kvstore *pubsubshard_channels;  /* Map shard channels in every slot to list of subscribed clients */

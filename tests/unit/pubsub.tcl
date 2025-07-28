@@ -245,6 +245,163 @@ start_server {tags {"pubsub network"}} {
         concat $reply1 $reply2
     } {punsubscribe {} 0 unsubscribe {} 0}
 
+    # --- Trie-based PSUBSCRIBE tests ---
+
+    test "PSUBSCRIBE with trie: basic prefix matching" {
+        set rd1 [redis_deferring_client]
+
+        # Subscribe to patterns that should use the trie
+        assert_equal {1 2 3} [psubscribe $rd1 {a* ab* abc*}]
+
+        # Test publications
+        assert_equal 1 [r publish a "msg1"]
+        assert_equal {pmessage a* a msg1} [$rd1 read]
+
+        assert_equal 2 [r publish ab "msg2"]
+        set replies [list]
+        lappend replies [$rd1 read]
+        lappend replies [$rd1 read]
+        assert_equal {{pmessage a* ab msg2} {pmessage ab* ab msg2}} [lsort $replies]
+
+        assert_equal 3 [r publish abc "msg3"]
+        set replies [list]
+        lappend replies [$rd1 read]
+        lappend replies [$rd1 read]
+        lappend replies [$rd1 read]
+        assert_equal {{pmessage a* abc msg3} {pmessage ab* abc msg3} {pmessage abc* abc msg3}} [lsort $replies]
+
+        assert_equal 3 [r publish abcd "msg4"]
+        set replies [list]
+        lappend replies [$rd1 read]
+        lappend replies [$rd1 read]
+        lappend replies [$rd1 read]
+        assert_equal {{pmessage a* abcd msg4} {pmessage ab* abcd msg4} {pmessage abc* abcd msg4}} [lsort $replies]
+
+        # Test no match
+        assert_equal 0 [r publish b "msg5"]
+        assert_equal 0 [r publish xabc "msg6"]
+
+        # Cleanup
+        punsubscribe $rd1
+        $rd1 close
+    }
+
+    test "PSUBSCRIBE with trie: overlapping prefixes and unsub" {
+        set rd1 [redis_deferring_client]
+        set rd2 [redis_deferring_client]
+
+        psubscribe $rd1 {foo*}
+        psubscribe $rd2 {foobar*}
+
+        # Test publish to longer channel
+        assert_equal 2 [r publish foobar "msg1"]
+        set replies [list]
+        lappend replies [$rd1 read]
+        lappend replies [$rd2 read]
+        assert_equal {{pmessage foo* foobar msg1} {pmessage foobar* foobar msg1}} [lsort $replies]
+
+        # Test publish to shorter channel
+        assert_equal 1 [r publish foo "msg2"]
+        assert_equal {pmessage foo* foo msg2} [$rd1 read]
+
+        # Unsubscribe one
+        punsubscribe $rd1 {foo*}
+        assert_equal 1 [r publish foobar "msg3"]
+        assert_equal {pmessage foobar* foobar msg3} [$rd2 read]
+        assert_equal 0 [r publish foo "msg4"]
+
+        # Cleanup
+        punsubscribe $rd2
+        $rd1 close
+        $rd2 close
+    }
+
+    test "PSUBSCRIBE with trie: mixed with glob-style patterns" {
+        set rd1 [redis_deferring_client]
+
+        # trie pattern, and two glob patterns
+        psubscribe $rd1 {foo* f?o f*o}
+
+        # Publish to something that matches all three
+        assert_equal 3 [r publish foo "msg1"]
+        set replies [list]
+        lappend replies [$rd1 read]
+        lappend replies [$rd1 read]
+        lappend replies [$rd1 read]
+        assert_equal {{pmessage f*o foo msg1} {pmessage f?o foo msg1} {pmessage foo* foo msg1}} [lsort $replies]
+
+        # Publish to something that matches two
+        assert_equal 2 [r publish fyo "msg2"]
+        set replies [list]
+        lappend replies [$rd1 read]
+        lappend replies [$rd1 read]
+        assert_equal {{pmessage f*o fyo msg2} {pmessage f?o fyo msg2}} [lsort $replies]
+
+        # Publish to something that matches one (trie)
+        assert_equal 1 [r publish foobar "msg3"]
+        assert_equal {pmessage foo* foobar msg3} [$rd1 read]
+        
+        # Publish to something that matches one (glob)
+        assert_equal 1 [r publish f--o "msg4"]
+        assert_equal {pmessage f*o f--o msg4} [$rd1 read]
+
+        # Cleanup
+        punsubscribe $rd1
+        $rd1 close
+    }
+
+    test "PSUBSCRIBE with trie: NUMPAT correctness" {
+        set rd1 [redis_deferring_client]
+        set rd2 [redis_deferring_client]
+
+        # Initial state
+        assert_equal 0 [r pubsub numpat]
+
+        # Add one pattern
+        psubscribe $rd1 {key*}
+        assert_equal 1 [r pubsub numpat]
+
+        # Add same pattern from another client
+        psubscribe $rd2 {key*}
+        assert_equal 1 [r pubsub numpat]
+
+        # Add a different trie pattern
+        psubscribe $rd1 {key2*}
+        assert_equal 2 [r pubsub numpat]
+
+        # Add a glob pattern
+        psubscribe $rd1 {k?y*}
+        assert_equal 3 [r pubsub numpat]
+
+        # Unsubscribe one instance of key*
+        punsubscribe $rd1 {key*}
+        assert_equal 3 [r pubsub numpat] ;# Total unique patterns is still 3
+
+        # Unsubscribe the other instance of key*
+        punsubscribe $rd2 {key*}
+        assert_equal 2 [r pubsub numpat]
+
+        # Cleanup
+        punsubscribe $rd1
+        $rd1 close
+        $rd2 close
+    }
+
+    test "PSUBSCRIBE with trie: empty prefix" {
+        set rd1 [redis_deferring_client]
+        for {set i 0} {$i < 100} {incr i} {
+            assert_equal {1} [psubscribe $rd1 *]
+            assert_equal 1 [r pubsub numpat]
+            assert_equal 1 [r publish foo "msg1"]
+            assert_equal {pmessage * foo msg1} [$rd1 read]
+            assert_equal 1 [r publish bar "msg2"]
+            assert_equal {pmessage * bar msg2} [$rd1 read]
+            assert_equal {0} [punsubscribe $rd1 *]
+            assert_equal 0 [r pubsub numpat]
+        }
+        $rd1 close
+    }
+
     ### Keyspace events notification tests
 
     test "Keyspace notifications: we receive keyspace notifications" {
