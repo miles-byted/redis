@@ -53,6 +53,24 @@ void addReplyPubsubMessage(client *c, robj *channel, robj *msg) {
     if (!(old_flags & CLIENT_PUSHING)) c->flags &= ~CLIENT_PUSHING;
 }
 
+/* Check if a pattern is a prefix pattern (e.g., "foo*").
+ * Returns 1 if it's a prefix pattern, 0 otherwise. */
+int isPrefixPattern(sds pattern) {
+    size_t len = sdslen(pattern);
+    if (len < 1) return 0;
+
+    /* Check if the last character is '*' */
+    if (pattern[len - 1] != '*') return 0;
+
+    /* Check if there's only one '*' and it's at the end */
+    for (size_t i = 0; i < len - 1; i++) {
+        if (pattern[i] == '*' || pattern[i] == '?' || pattern[i] == '[' || pattern[i] == ']') return 0;
+    }
+
+    return 1;
+}
+
+
 /* Send a pubsub message of type "pmessage" to the client. The difference
  * with the "message" type delivered by addReplyPubsubMessage() is that
  * this message format also includes the pattern that matched the message. */
@@ -210,7 +228,6 @@ int pubsubUnsubscribeChannel(client *c, robj *channel, int notify) {
 
 /* Subscribe a client to a pattern. Returns 1 if the operation succeeded, or 0 if the client was already subscribed to that pattern. */
 int pubsubSubscribePattern(client *c, robj *pattern) {
-    dictEntry *de;
     list *clients;
     int retval = 0;
 
@@ -219,14 +236,34 @@ int pubsubSubscribePattern(client *c, robj *pattern) {
         listAddNodeTail(c->pubsub_patterns,pattern);
         incrRefCount(pattern);
         /* Add the client to the pattern -> list of clients hash table */
-        de = dictFind(server.pubsub_patterns,pattern);
-        if (de == NULL) {
-            clients = listCreate();
-            dictAdd(server.pubsub_patterns,pattern,clients);
-            incrRefCount(pattern);
+        sds prefix_sds = sdsdup(pattern->ptr);
+        int is_prefix = isPrefixPattern(pattern->ptr);
+        if (is_prefix) {
+            sdssubstr(prefix_sds, 0, sdslen(prefix_sds)-1);
+            clients = trie_lookup(server.pubsub_patterns_trie, prefix_sds);
         } else {
-            clients = dictGetVal(de);
+            dictEntry *de = dictFind(server.pubsub_patterns,pattern);
+            if (de == NULL) {
+                clients = NULL;
+            } else {
+                clients = dictGetVal(de);
+            }
+            if (de == NULL) {
+                clients = listCreate();
+            } else {
+                clients = dictGetVal(de);
+            }
         }
+        if (clients == NULL) {
+            clients = listCreate();
+            if (is_prefix) {
+                trie_insert(server.pubsub_patterns_trie, prefix_sds, clients);
+            } else {
+                dictAdd(server.pubsub_patterns,pattern,clients);
+                incrRefCount(pattern);
+            }
+        }
+        sdsfree(prefix_sds);
         listAddNodeTail(clients,c);
     }
     /* Notify the client */
@@ -237,7 +274,6 @@ int pubsubSubscribePattern(client *c, robj *pattern) {
 /* Unsubscribe a client from a channel. Returns 1 if the operation succeeded, or
  * 0 if the client was not subscribed to the specified channel. */
 int pubsubUnsubscribePattern(client *c, robj *pattern, int notify) {
-    dictEntry *de;
     list *clients;
     listNode *ln;
     int retval = 0;
@@ -247,17 +283,31 @@ int pubsubUnsubscribePattern(client *c, robj *pattern, int notify) {
         retval = 1;
         listDelNode(c->pubsub_patterns,ln);
         /* Remove the client from the pattern -> clients list hash table */
-        de = dictFind(server.pubsub_patterns,pattern);
-        serverAssertWithInfo(c,NULL,de != NULL);
-        clients = dictGetVal(de);
+        sds prefix_sds = sdsdup(pattern->ptr);
+        int is_prefix = isPrefixPattern(pattern->ptr);
+        if (is_prefix) {
+            sdssubstr(prefix_sds, 0, sdslen(prefix_sds)-1);
+            clients = trie_lookup(server.pubsub_patterns_trie, prefix_sds);
+            serverAssertWithInfo(c,NULL,clients != NULL);
+        } else {
+            dictEntry *de = dictFind(server.pubsub_patterns,pattern);
+            serverAssertWithInfo(c,NULL,de != NULL);
+            clients = dictGetVal(de);
+        }
         ln = listSearchKey(clients,c);
         serverAssertWithInfo(c,NULL,ln != NULL);
         listDelNode(clients,ln);
         if (listLength(clients) == 0) {
             /* Free the list and associated hash entry at all if this was
              * the latest client. */
-            dictDelete(server.pubsub_patterns,pattern);
+            if (is_prefix) {
+                trie_delete(server.pubsub_patterns_trie, prefix_sds);
+                listRelease(clients);
+            } else {
+                dictDelete(server.pubsub_patterns,pattern);
+            }
         }
+        sdsfree(prefix_sds);
     }
     /* Notify the client */
     if (notify) addReplyPubsubPatUnsubscribed(c,pattern);
@@ -325,9 +375,29 @@ int pubsubPublishMessage(robj *channel, robj *message) {
         }
     }
     /* Send to clients listening to matching channels */
+    channel = getDecodedObject(channel);
+    /* Match trie first */
+    trie_iterator *it = trie_iterator_new(server.pubsub_patterns_trie, channel->ptr);
+    if (it) {
+        trie_iterator_set_ends_with_star(it, 1);
+        sds iter_key = NULL;
+        list *iter_clients;
+        while ((iter_clients = trie_iterator_next(it, &iter_key)) != NULL) {
+            robj *pattern = createStringObject(iter_key, sdslen(iter_key));
+            listRewind(iter_clients,&li);
+            while ((ln = listNext(&li)) != NULL) {
+                client *c = listNodeValue(ln);
+                addReplyPubsubPatMessage(c, pattern, channel, message);
+                receivers++;
+            }
+            decrRefCount(pattern);
+            sdsfree(iter_key);
+        }
+        trie_iterator_free(it);
+    }
+    /* Match dict */
     di = dictGetIterator(server.pubsub_patterns);
     if (di) {
-        channel = getDecodedObject(channel);
         while((de = dictNext(di)) != NULL) {
             robj *pattern = dictGetKey(de);
             list *clients = dictGetVal(de);
@@ -343,9 +413,9 @@ int pubsubPublishMessage(robj *channel, robj *message) {
                 receivers++;
             }
         }
-        decrRefCount(channel);
         dictReleaseIterator(di);
     }
+    decrRefCount(channel);
     return receivers;
 }
 
@@ -480,7 +550,7 @@ NULL
         }
     } else if (!strcasecmp(c->argv[1]->ptr,"numpat") && c->argc == 2) {
         /* PUBSUB NUMPAT */
-        addReplyLongLong(c,dictSize(server.pubsub_patterns));
+        addReplyLongLong(c,dictSize(server.pubsub_patterns) + trie_size(server.pubsub_patterns_trie));
     } else {
         addReplySubcommandSyntaxError(c);
     }

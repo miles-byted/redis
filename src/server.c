@@ -3271,6 +3271,7 @@ void initServer(void) {
     evictionPoolAlloc(); /* Initialize the LRU keys pool. */
     server.pubsub_channels = dictCreate(&keylistDictType,NULL);
     server.pubsub_patterns = dictCreate(&keylistDictType,NULL);
+    server.pubsub_patterns_trie = trie_new();
     server.cronloops = 0;
     server.in_eval = 0;
     server.in_exec = 0;

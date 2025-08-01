@@ -74,6 +74,7 @@ typedef long long ustime_t; /* microsecond time type. */
                            N-elements flat arrays */
 #include "rax.h"     /* Radix tree */
 #include "connection.h" /* Connection abstraction */
+#include "trie.h"    /* Trie data structure */
 
 #define REDISMODULE_CORE 1
 #include "redismodule.h"    /* Redis modules API defines. */
@@ -1551,6 +1552,7 @@ struct redisServer {
     /* Pubsub */
     dict *pubsub_channels;  /* Map channels to list of subscribed clients */
     dict *pubsub_patterns;  /* A dict of pubsub_patterns */
+    trie *pubsub_patterns_trie; /* A trie of pubsub_patterns */
     int notify_keyspace_events; /* Events to propagate via Pub/Sub. This is an
                                    xor of NOTIFY_... flags. */
     /* Cluster */
